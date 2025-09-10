@@ -67,6 +67,9 @@ Adafruit_ADS1115 ads;  // Use ADS1115 (16-bit)
 #define VOLTAGE_STEP_LEVEL_DOWN 0.1 // Voltage decrease for level (V)
 #define CHECK_DELAY 300         // Check delay (ms)
 #define LEVEL_CHECK_DELAY 10000 // Level check delay (ms)
+// Trend detection thresholds to identify balance (avoid reacting to noise)
+#define TREND_EPS_P_BAR 0.02    // Significant change in bar
+#define TREND_EPS_L_M 0.02      // Significant change in meters
 
 // Timing intervals
 unsigned long previousMillis = 0;
@@ -83,6 +86,7 @@ enum ControlState {
   IDLE,
   STARTING,
   RUNNING,
+  BALANCED,
   ADJUSTING_P1,
   ADJUSTING_P2,
   ADJUSTING_LEVEL,
@@ -95,6 +99,13 @@ unsigned long lastCheckTime = 0;
 float currentVoltage = 0.0;
 float targetVoltage = 0.0;
 bool autoControlActive = false;
+// Probe variables for balance detection
+bool probeActive = false;
+unsigned long probeStartTime = 0;
+float probeBaselineP1 = 0.0;
+float probeBaselineP2 = 0.0;
+float probeBaselineLevel = 0.0;
+float probeBaselineVoltage = 0.0;
 
 // Button state tracking
 bool startButtonPressed = false;
@@ -332,11 +343,68 @@ void runControlStateMachine() {
         break;
       }
       
-      // If all parameters are good, continue increasing voltage
+      // If all parameters are good, perform probe to detect balance
       if (currentTime - lastCheckTime >= CHECK_DELAY) {
-        targetVoltage = currentVoltage + VOLTAGE_STEP_UP;
-        lastCheckTime = currentTime;
-        Serial.println("All parameters OK, increasing voltage");
+        if (!probeActive) {
+          // Start probe: record baseline and apply small increase
+          probeActive = true;
+          probeStartTime = currentTime;
+          probeBaselineP1 = pressure1;
+          probeBaselineP2 = pressure2;
+          probeBaselineLevel = level;
+          probeBaselineVoltage = currentVoltage;
+          targetVoltage = currentVoltage + VOLTAGE_STEP_UP; // small probe step
+          Serial.println("Probe started to detect balance");
+        } else {
+          // Evaluate probe results
+          float dP1 = pressure1 - probeBaselineP1;
+          float dP2 = pressure2 - probeBaselineP2;
+          float dL  = level - probeBaselineLevel;
+          bool p1Down = dP1 < -TREND_EPS_P_BAR;
+          bool p2Up   = dP2 >  TREND_EPS_P_BAR;
+          bool lvlDown= dL  < -TREND_EPS_L_M;
+          if (p1Down && p2Up && lvlDown) {
+            // Balance found: revert to baseline and hold
+            targetVoltage = probeBaselineVoltage;
+            currentState = BALANCED;
+            Serial.println("Balance detected. Holding voltage constant.");
+          } else {
+            // Not balanced yet: continue gradual increase
+            targetVoltage = currentVoltage + VOLTAGE_STEP_UP;
+            Serial.println("No balance yet. Increasing voltage.");
+          }
+          probeActive = false;
+          lastCheckTime = currentTime;
+        }
+      }
+      break;
+
+    case BALANCED:
+      if (stopButtonPressed) {
+        currentState = STOPPING;
+        stateStartTime = currentTime;
+        Serial.println("Stopping automatic control");
+        break;
+      }
+      // In balanced state keep voltage constant unless constraints violated
+      if (pressure1 < PRESSURE_1_MIN) {
+        currentState = ADJUSTING_P1;
+        targetVoltage = currentVoltage - VOLTAGE_STEP_P1_DOWN;
+        stateStartTime = currentTime;
+        Serial.println("P1 low in BALANCED, adjusting down");
+      } else if (pressure2 > PRESSURE_2_MAX) {
+        currentState = ADJUSTING_P2;
+        targetVoltage = currentVoltage - VOLTAGE_STEP_P2_DOWN;
+        stateStartTime = currentTime;
+        Serial.println("P2 high in BALANCED, adjusting down");
+      } else if (level < LEVEL_MIN) {
+        currentState = ADJUSTING_LEVEL;
+        targetVoltage = currentVoltage - VOLTAGE_STEP_LEVEL_DOWN;
+        stateStartTime = currentTime;
+        Serial.println("Level low in BALANCED, adjusting down");
+      } else {
+        // Keep target equal to current to avoid drift
+        targetVoltage = currentVoltage;
       }
       break;
       
@@ -515,6 +583,9 @@ void updateLCD(float p1, float p2, float lvl, float multiplexed, float voltage, 
       break;
     case RUNNING:
       lcd.print("RUN");
+      break;
+    case BALANCED:
+      lcd.print("BAL");
       break;
     case ADJUSTING_P1:
       lcd.print("ADJ P1");
